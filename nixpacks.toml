@@ -1,9 +1,8 @@
-
 [phases.setup]
-nixPkgs = ["python311", "gcc"]
+nixPkgs = ["python3", "python3Packages.pip", "gcc"]
 
 [phases.install]
-cmds = ["pip install gunicorn flask flask-cors psycopg2-binary"]
+cmds = ["pip3 install gunicorn flask flask-cors psycopg2-binary"]
 
 [start]
 cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60"
