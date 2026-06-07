@@ -88,6 +88,41 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id          TEXT PRIMARY KEY,
+            email       TEXT UNIQUE NOT NULL,
+            password    TEXT NOT NULL,
+            full_name   TEXT,
+            branch      TEXT,
+            created_at  TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contributions (
+            id          TEXT PRIMARY KEY,
+            donor_name  TEXT NOT NULL,
+            amount      REAL,
+            currency    TEXT DEFAULT 'UGX',
+            is_anonymous BOOLEAN DEFAULT FALSE,
+            created_at  TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            id          TEXT PRIMARY KEY,
+            type        TEXT,
+            title       TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            date        TEXT,
+            thumbnail   TEXT,
+            src         TEXT NOT NULL,
+            created_at  TEXT
+        )
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
@@ -140,6 +175,74 @@ def now():
 @app.route("/api/ping")
 def ping():
     return jsonify({"status": "ok", "service": "Magoye Family API", "db": "postgresql"})
+
+# ─────────────────────────────────────────
+# AUTHENTICATION
+# ─────────────────────────────────────────
+@app.route("/api/auth/register", methods=["POST"])
+@rate_limit(10)
+def register():
+    data = request.get_json(force=True, silent=True) or {}
+    email = sanitise(data.get("email",""), 100).strip().lower()
+    password = data.get("password","")
+    full_name = sanitise(data.get("fullName",""), 100)
+    branch = sanitise(data.get("branch",""), 100)
+    
+    if not email or not password:
+        return jsonify({"error": "email and password are required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+    
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+        if cur.fetchone():
+            cur.close(); conn.close()
+            return jsonify({"error": "Email already registered"}), 409
+        
+        rec = {
+            "id": new_id(),
+            "email": email,
+            "password": password,
+            "full_name": full_name,
+            "branch": branch,
+            "created_at": now()
+        }
+        cur.execute("""INSERT INTO users (id,email,password,full_name,branch,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s)""", tuple(rec.values()))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True, "id": rec["id"]}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/auth/login", methods=["POST"])
+@rate_limit(20)
+def login():
+    data = request.get_json(force=True, silent=True) or {}
+    email = sanitise(data.get("email",""), 100).strip().lower()
+    password = data.get("password","")
+    
+    if not email or not password:
+        return jsonify({"error": "email and password are required"}), 400
+    
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+        user = cur.fetchone()
+        cur.close(); conn.close()
+        
+        if not user or user['password'] != password:
+            return jsonify({"error": "Invalid credentials"}), 401
+        
+        return jsonify({
+            "success": True,
+            "id": user['id'],
+            "email": user['email'],
+            "full_name": user['full_name'],
+            "branch": user['branch']
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─────────────────────────────────────────
 # UPDATES
@@ -357,6 +460,108 @@ def send_chat():
     return jsonify(rec), 201
 
 # ─────────────────────────────────────────
+# MEDIA LIBRARY
+# ─────────────────────────────────────────
+@app.route("/api/media/library", methods=["GET"])
+@rate_limit(60)
+def get_media():
+    limit = min(int(request.args.get("limit", 50)), 200)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT * FROM media ORDER BY created_at DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify([row(r) for r in rows])
+
+@app.route("/api/media/library", methods=["POST"])
+@require_api_key
+@rate_limit(30)
+def add_media():
+    data = request.get_json(force=True, silent=True) or {}
+    title = sanitise(data.get("title",""), 200).strip()
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    
+    rec = {
+        "id": new_id(),
+        "type": sanitise(data.get("type","Podcast"), 50),
+        "title": title,
+        "description": sanitise(data.get("description",""), 500),
+        "date": sanitise(data.get("date",""), 30),
+        "thumbnail": data.get("thumbnail","")[:10000],
+        "src": data.get("src","")[:10000],
+        "created_at": now()
+    }
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""INSERT INTO media (id,type,title,description,date,thumbnail,src,created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", tuple(rec.values()))
+    conn.commit(); cur.close(); conn.close()
+    return jsonify({"success": True, "id": rec["id"]}), 201
+
+@app.route("/api/media/<mid>", methods=["DELETE"])
+@require_api_key
+@rate_limit(60)
+def delete_media(mid):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM media WHERE id=%s", (mid,))
+    conn.commit(); cur.close(); conn.close()
+    return jsonify({"success": True})
+
+# ─────────────────────────────────────────
+# LEGACY FUND
+# ─────────────────────────────────────────
+@app.route("/api/legacy-fund/summary", methods=["GET"])
+@rate_limit(60)
+def get_legacy_summary():
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_raised, COUNT(*) as supporters FROM contributions WHERE is_anonymous=FALSE")
+    summary = dict(cur.fetchone())
+    cur.close(); conn.close()
+    return jsonify({
+        "target_amount": 75000000,
+        "target_currency": "UGX",
+        "amount_raised": int(summary.get("total_raised", 0)),
+        "currency": "UGX",
+        "supporters": int(summary.get("supporters", 0)),
+        "percentage": int((int(summary.get("total_raised", 0)) / 75000000) * 100) if summary.get("total_raised") else 0
+    })
+
+@app.route("/api/legacy-fund/contributions", methods=["GET"])
+@rate_limit(60)
+def get_contributions():
+    limit = min(int(request.args.get("limit", 6)), 50)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""SELECT id, donor_name, amount, currency, is_anonymous, created_at 
+        FROM contributions ORDER BY created_at DESC LIMIT %s""", (limit,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify([row(r) for r in rows])
+
+@app.route("/api/legacy-fund/contributions", methods=["POST"])
+@rate_limit(20)
+def add_contribution():
+    data = request.get_json(force=True, silent=True) or {}
+    donor_name = sanitise(data.get("donor_name",""), 100)
+    amount = float(data.get("amount", 0))
+    is_anonymous = data.get("is_anonymous", False)
+    
+    if amount <= 0:
+        return jsonify({"error": "amount must be greater than 0"}), 400
+    
+    rec = {
+        "id": new_id(),
+        "donor_name": donor_name if not is_anonymous else "Anonymous Contributor",
+        "amount": amount,
+        "currency": sanitise(data.get("currency","UGX"), 10),
+        "is_anonymous": is_anonymous,
+        "created_at": now()
+    }
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""INSERT INTO contributions (id,donor_name,amount,currency,is_anonymous,created_at)
+        VALUES (%s,%s,%s,%s,%s,%s)""", tuple(rec.values()))
+    conn.commit(); cur.close(); conn.close()
+    return jsonify(rec), 201
+
+# ─────────────────────────────────────────
 # STATS
 # ─────────────────────────────────────────
 @app.route("/api/stats")
@@ -364,7 +569,16 @@ def send_chat():
 @rate_limit(60)
 def get_stats():
     conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT (SELECT COUNT(*) FROM updates) AS updates, (SELECT COUNT(*) FROM members) AS members, (SELECT COUNT(*) FROM gallery) AS gallery, (SELECT COUNT(*) FROM chat) AS chat")
+    cur.execute("""SELECT 
+        (SELECT COUNT(*) FROM updates) AS updates, 
+        (SELECT COUNT(*) FROM members) AS members, 
+        (SELECT COUNT(*) FROM gallery) AS gallery, 
+        (SELECT COUNT(*) FROM chat) AS chat,
+        (SELECT COUNT(*) FROM users) AS users,
+        (SELECT COUNT(*) FROM media) AS media,
+        (SELECT COUNT(*) FROM contributions) AS contributions,
+        (SELECT COALESCE(SUM(amount), 0) FROM contributions) AS total_raised
+    """)
     r = dict(cur.fetchone())
     cur.close(); conn.close()
     return jsonify(r)
